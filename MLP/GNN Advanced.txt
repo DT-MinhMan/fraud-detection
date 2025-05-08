@@ -1,0 +1,132 @@
+import os
+os.environ["DGLBACKEND"] = "pytorch"
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.nn as dglnn
+from neo4j import GraphDatabase
+import pandas as pd
+import numpy as np
+import networkx as nx
+from torch.utils.data import DataLoader, TensorDataset
+import torch.optim as optim
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+class Neo4jConnector:
+    def __init__(self, uri, user, password):
+        try:
+            self.driver = GraphDatabase.driver(uri, auth=(user, password))
+            print("Connected to Neo4j successfully!")
+        except Exception as e:
+            print(f"Failed to connect to Neo4j: {e}")
+
+    def close(self):
+        self.driver.close()
+
+    def run_query(self, query):
+        with self.driver.session() as session:
+            return list(session.run(query))
+
+# Example connection
+uri = "bolt://localhost:7687"
+user = "neo4j"
+password = os.getenv("NEO4J_PASSWORD", "12345678")
+
+connector = Neo4jConnector(uri, user, password)
+
+# Query to extract node features
+node_query = """
+MATCH (n)
+RETURN id(n) AS node_id, n.property1 AS feature1, n.property2 AS feature2, n.label AS label
+"""
+nodes = connector.run_query(node_query)
+node_features = []
+labels = []
+
+for record in nodes:
+    node_features.append({
+        "node_id": record["node_id"],
+        "feature1": record.get("feature1", 0),
+        "feature2": record.get("feature2", 0)
+    })
+    labels.append(record.get("label", 0))
+
+# Query to extract edges
+edge_query = """
+MATCH (n1)-[r]->(n2)
+RETURN id(n1) AS source, id(n2) AS target, type(r) AS relation_type
+"""
+edges = connector.run_query(edge_query)
+edge_list = [(record["source"], record["target"]) for record in edges]
+
+# Convert node features to DataFrame
+node_df = pd.DataFrame(node_features).fillna(0)
+feature_matrix = node_df.drop(columns=["node_id"]).to_numpy()
+
+# Convert labels to tensor
+labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+# Create NetworkX graph
+graph = nx.DiGraph()
+graph.add_nodes_from(node_df["node_id"].values)
+graph.add_edges_from(edge_list)
+
+# Convert to DGL graph
+dgl_graph = dgl.from_networkx(graph)
+dgl_graph = dgl.add_self_loop(dgl_graph)
+dgl_graph.ndata['features'] = torch.tensor(feature_matrix, dtype=torch.float32)
+
+class FraudDetectionGNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(FraudDetectionGNN, self).__init__()
+        self.conv1 = dglnn.GraphConv(input_size, hidden_size)
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.conv2 = dglnn.GraphConv(hidden_size, hidden_size)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.conv3 = dglnn.GraphConv(hidden_size, output_size)
+
+    def forward(self, g, features):
+        x = F.relu(self.bn1(self.conv1(g, features)))
+        x = F.relu(self.bn2(self.conv2(g, x)))
+        x = self.conv3(g, x)
+        return x
+
+input_size = feature_matrix.shape[1]
+model = FraudDetectionGNN(input_size, hidden_size=64, output_size=2)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+
+# Training loop with evaluation metrics
+for epoch in range(20):
+    model.train()
+    optimizer.zero_grad()
+    predictions = model(dgl_graph, dgl_graph.ndata['features'])
+    loss = criterion(predictions, labels_tensor)
+    loss.backward()
+    optimizer.step()
+
+    # Backward pass debugging
+    loss.backward()
+    optimizer.step()
+
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        preds = torch.argmax(predictions, dim=1).cpu().numpy()
+        true_labels = labels_tensor.cpu().numpy()
+        acc = accuracy_score(true_labels, preds)
+        precision = precision_score(true_labels, preds, zero_division=0)
+        recall = recall_score(true_labels, preds, zero_division=0)
+        f1 = f1_score(true_labels, preds, zero_division=0)
+
+    print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}, Accuracy: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+
+# Inference on first 5 nodes
+test_node_ids = torch.arange(min(5, dgl_graph.num_nodes()))
+with torch.no_grad():
+    test_predictions = model(dgl_graph, dgl_graph.ndata['features'])[test_node_ids]
+    print("Test Predictions:", torch.argmax(test_predictions, dim=1).numpy())
+
+connector.close()
